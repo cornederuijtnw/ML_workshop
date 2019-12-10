@@ -1,0 +1,273 @@
+---
+title: "Yelp_peek"
+author: "Corne"
+date: "11/30/2019"
+output: html_document
+---
+
+```{r importdata, include=F, echo = FALSE, warning = FALSE,message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+library(data.table)
+library(lubridate)
+library(stringr)
+library(tidytext)
+library(ggmap)
+
+setwd("~/github/yelpchallenge")
+
+# Review sample:
+ds_reviews <- as.data.frame(fread("./data/training_sample_30k.csv"))
+ds_reviews$date <- as.Date(ds_reviews$date)
+
+users <- as.data.frame(fread("./data/original_ds/yelp_user.csv"))
+users <- users %>% sample_n(30000)
+
+businesses <- as.data.frame(fread("./data/original_ds/yelp_business.csv"))
+business_att <- as.data.frame(fread("./data/original_ds/yelp_business_attributes.csv"))
+
+businesses <- businesses %>% 
+  left_join(business_att, by="business_id")
+
+businesses <- businesses %>% sample_n(30000)
+
+restaurants <- businesses %>%
+  unnest_tokens(business_cat, categories, token=stringr::str_split, pattern=";") %>%
+  group_by(business_id) %>%
+  summarize(is_restaurant=sum(business_cat=="restaurants")) %>%
+  select(business_id) %>%
+  pull()
+  
+ds_reviews <- ds_reviews %>%
+  filter(business_id %in% restaurants)
+
+business_rest <- businesses %>%
+  filter(business_id %in% restaurants)
+
+print("Number of reviews:")
+nrow(ds_reviews)
+
+```
+
+## 1) When were the reviews given?
+There's definitely been a significant increase in the number reviews. Clearly reflects the growth in popularity of Yelp. Is it then fair to split the dataset on time? Perhaps, depends on the inter-review time.
+```{r Q1, echo = FALSE, warning = FALSE,message = FALSE}
+  ds_reviews %>%
+    mutate(review_ym = round_date(date, "month")) %>%
+    group_by(review_ym) %>%
+    summarize(freq=n()) %>%
+ggplot(., aes(x=review_ym, y=freq))+
+  geom_line()+
+  theme_classic()
+
+```
+
+## 2) What is the typical inter-review time?
+Some interesting behavior. Approximately 22% of the reviews is given on the same day as the previous review. After that the inter-review time seems to follow some kind of Pareto distribution, i.e., the cdf does not show exponential decay. 
+```{r Q2, echo = FALSE, warning = FALSE,message = FALSE}
+ds_reviews %>%
+  arrange(date,user_id) %>%
+  group_by(user_id) %>%
+  mutate(prev_review = lag(date)) %>%
+  mutate(inter_review_time = as.numeric(date-prev_review)+1) %>% # Use +1 to also obtain 0 days
+ggplot(., aes(inter_review_time))+
+  geom_histogram(fill='grey', color="black")+
+  scale_x_log10()+
+  theme_classic()
+
+ds_reviews %>%
+  arrange(date,user_id) %>%
+  group_by(user_id) %>%
+  mutate(prev_review = lag(date)) %>%
+  mutate(inter_review_time = as.numeric(date-prev_review)+1) %>% # Use +1 to also obtain 0 days
+ggplot(., aes(inter_review_time))+
+  stat_ecdf()+
+  scale_x_log10()+
+  theme_classic()
+
+```
+
+## 3) Do users review the same business at least twice?
+Nope, interestingly no duplicates.
+```{r Q3, echo = FALSE, warning = FALSE,message = FALSE}
+(ds_reviews %>%
+  group_by(user_id, business_id) %>%
+  summarize(freq=n()) %>%
+  filter(freq>1) %>%
+  ungroup() %>%
+  summarize(n()) %>%
+  pull)/nrow(ds_reviews)
+```
+
+## 4) What is the correlation between fans and friends?
+The friends option is much more popular than the fan option. Only probably some very active users attract 'fans', though this number remains limited compared to the number of friends. Interestingly, there are also some users without friends, but with many fans.
+
+```{r Q4, echo = FALSE, warning = FALSE,message = FALSE}
+fans_vs_friends <- users %>%
+    mutate(no_friends = str_count(friends,",")) %>%  #Actually counts one friend too few if person has friends
+    select(no_friends,fans)
+
+cor(fans_vs_friends$no_friends, fans_vs_friends$fans) #
+
+fans_vs_friends %>%
+    sample_n(10000) %>%
+    mutate(no_friends=no_friends+1,
+           fans=fans+1) %>%
+    ggplot(.,aes(x=no_friends,y=fans))+
+    geom_point()+
+    scale_x_log10()+
+    scale_y_log10()+
+    geom_smooth()+
+    theme_classic()
+
+  
+```
+
+## 5) What is the review activity measured from the first review in the data?
+Indeed the activity seems to drop after the first few days of measurement. Although we cannot be sure, we can at least not reject that many users use Yelp frequently at first, after which their interest drops.
+
+```{r Q5, echo = FALSE, warning = FALSE,message = FALSE}
+ds_reviews %>%
+  arrange(date,user_id) %>%
+  group_by(user_id) %>%
+  mutate(prev_review = lag(date)) %>%
+  mutate(inter_review_time = as.numeric(date-prev_review)) %>%
+  filter(!is.na(inter_review_time)) %>%
+  mutate(cum_time = cumsum(inter_review_time)) %>%
+  group_by(user_id, cum_time) %>%
+  summarize(activity=n()) %>%
+  mutate(cum_time=cum_time+1) %>%
+  ggplot(.,aes(cum_time,activity))+
+  geom_point()+
+  scale_x_log10()+
+  scale_y_log10()+
+  geom_smooth()+
+  theme_classic()
+  
+```
+
+## 6) What kind of restaurants are there in the dataset (and do they correspond with their expected opening times {I ignore it for now})
+Approximately 31% of all businesses is a restaurant. Note that this is a lower bound: there might be more restaurants which are not labeled as restaurants. In total businesses might have 1140 'tags', though the hierarchical structure here is lacking (e.g., a Suchi bar is a restaurant). When considering only restaurants there are 426 categories. Also within the categories there is a missing hierarchy (i.e., many categories can be considered 'food' or 'fast food'). We could argue this at least to some extent reflects the distribution of restaurant types in the US.
+```{r Q6, echo = FALSE, warning = FALSE,message = FALSE}
+business_cats <- businesses %>%
+  unnest_tokens(business_cat, categories, token=stringr::str_split, pattern=";") %>%
+  group_by(business_id) %>%
+  mutate(is_restaurant=sum(business_cat=="restaurants")) %>%
+  select(business_id, business_cat, is_restaurant) %>%
+  ungroup()
+
+business_cats %>%
+  group_by(business_id) %>%
+  summarize(is_restaurant=max(is_restaurant)) %>%
+  group_by(is_restaurant) %>%
+  summarize(freq=n()) %>%
+  mutate(freq=freq/sum(freq)) # 31% of all businesses is a restaurant
+
+print("all business categories:")
+n_distinct(business_cats$business_cat)
+
+print("all restaurant categories:")
+n_distinct(business_cats$business_cat[business_cats$is_restaurant==1])
+
+business_cats %>%
+  filter(is_restaurant==1 & business_cat!="restaurants") %>%
+  group_by(business_cat) %>%
+  summarize(freq=n()) %>%
+  mutate(freq=freq/sum(freq)) %>%
+  top_n(50) %>%
+  mutate(business_cat=factor(business_cat, levels=unique(business_cat[order(freq)]), ordered=T)) %>%
+  ggplot(., aes(x=business_cat, y=freq)) +
+  geom_bar(stat="identity")+
+  theme_classic()+
+  coord_flip()
+
+  
+
+```
+
+## 7) What is the rating spread?
+There is little spread: 54% of the users have only 1 rating, making it impossible to consider something like improvement over a baseline rating. I.e., indeed better to consider whether users will rate items at all (and assuming that poor items will not be re-rated, i.e., that simply the number of reviews is a proper measure for the popularity of an item). Even if there are multiple ratings, the majority of the users only gave the same rating. I suspect that if we would use a model which always produced rating '5', this would already be quite accurate. Ratings could also be dichotemized in <=3 or >3. It's interesting that the most common rating is 5. Do users especially rate items they like. 
+```{r Q7, echo = FALSE, warning = FALSE,message = FALSE}
+star_sd <-
+  ds_reviews %>%
+    group_by(user_id) %>%
+    summarize(rating_sd = sd(stars))
+
+sum(is.na(star_sd$rating_sd))/nrow(star_sd)
+
+star_sd %>%
+  ggplot(.,aes(rating_sd))+
+  geom_histogram(fill='grey', color="black")+
+  theme_classic()
+
+ds_reviews %>%
+  ggplot(.,aes(stars)) +
+  geom_histogram(fill='grey', color='black')+
+  theme_classic()
+  
+```
+
+## 8) Most frequent cities
+As Elvis would say, viva Las Vegas!
+```{r Q8, echo = FALSE, warning = FALSE,message = FALSE}
+  business_rest %>%
+  group_by(city) %>%
+  summarize(freq=n()) %>%
+  mutate(freq=freq/sum(freq)) %>%
+  top_n(50, wt=freq) %>%
+  mutate(city=factor(city, levels=unique(city[order(freq)]), ordered=T)) %>%
+  ggplot(.,aes(x=city, y=freq))+
+  geom_bar(stat="identity")+
+  theme_classic()+
+  coord_flip()
+```
+
+## 9) User frequencies in reviews
+High dispersion, many users with only one review
+```{r Q9, echo = FALSE, warning = FALSE,message = FALSE}
+  ds_reviews %>%
+  group_by(user_id) %>%
+  summarize(freq=n()) %>%
+  top_n(250, freq) %>%
+  mutate(user_id=factor(user_id, levels=unique(user_id[order(freq)]), ordered=TRUE)) %>%
+  ggplot(.,aes(x=user_id,y=freq))+
+  geom_bar(stat='identity')+
+  theme_classic()+
+  coord_flip()
+
+ds_reviews %>%
+  group_by(user_id) %>%
+  summarize(freq=n()) %>%
+  ggplot(.,aes(x=freq))+
+  geom_histogram(fill='grey', color='black')+
+  scale_x_log10()+
+  theme_classic()
+```
+
+## 10) item frequencies in reviews
+```{r Q10, echo = FALSE, warning = FALSE,message = FALSE}
+  ds_reviews %>%
+  group_by(business_id) %>%
+  summarize(freq=n()) %>%
+  top_n(250, freq) %>%
+  mutate(business_id=factor(business_id, levels=unique(business_id[order(freq)]), ordered=TRUE)) %>%
+  ggplot(.,aes(x=business_id,y=freq))+
+  geom_bar(stat='identity')+
+  theme_classic()+
+  coord_flip()
+
+ds_reviews %>%
+  group_by(business_id) %>%
+  summarize(freq=n()) %>%
+  ggplot(.,aes(x=freq))+
+  geom_histogram(fill='grey', color='black')+
+  scale_x_log10()+
+  theme_classic()
+```
+
+
+
+
+
